@@ -2,11 +2,10 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/torquem-ch/mdbx-go/mdbx"
 	"os"
-	"strconv"
 	"strings"
 
 	dbm "github.com/tendermint/tm-db"
@@ -20,39 +19,44 @@ const (
 )
 
 func main() {
-	args := os.Args[1:]
-	if len(args) < 3 || (args[0] != "data" && args[0] != "shape" && args[0] != "versions") {
-		fmt.Fprintln(os.Stderr, "Usage: iaviewer <data|shape|versions> <leveldb dir> <prefix> [version number]")
-		fmt.Fprintln(os.Stderr, "<prefix> is the prefix of db, and the iavl tree of different modules in cosmos-sdk uses ")
-		fmt.Fprintln(os.Stderr, "different <prefix> to identify, just like \"s/k:gov/\" represents the prefix of gov module")
-		os.Exit(1)
+	version := 6982000
+	dbDir := "/sandbox/terra-chain/data/application.db"
+
+	prefixes := []string{
+		"acc",
+		"bank",
+		"staking",
+		"mint",
+		"distribution",
+		"slashing",
+		"gov",
+		"params",
+		"ibc",
+		"upgrade",
+		"evidence",
+		"transfer",
+		"capability",
+		"oracle",
+		"market",
+		"treasury",
+		"wasm",
+		"authz",
+		"feegrant",
 	}
 
-	version := 0
-	if len(args) == 4 {
-		var err error
-		version, err = strconv.Atoi(args[3])
+	for _, prefix := range prefixes {
+		transformer := NewTransformer(prefix)
+
+		treePrefix := fmt.Sprintf("s/k:%s/", prefix)
+		tree, err := ReadTree(dbDir, version, []byte(treePrefix))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid version number: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Error reading data: %s\n", err)
 			os.Exit(1)
 		}
-	}
 
-	tree, err := ReadTree(args[1], version, []byte(args[2]))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading data: %s\n", err)
-		os.Exit(1)
-	}
-
-	switch args[0] {
-	case "data":
-		PrintKeys(tree)
-		fmt.Printf("Hash: %X\n", tree.Hash())
-		fmt.Printf("Size: %X\n", tree.Size())
-	case "shape":
-		PrintShape(tree)
-	case "versions":
-		PrintVersions(tree)
+		tree.Iterate(func(key []byte, value []byte) bool {
+			return transformer.walk(key, value)
+		})
 	}
 }
 
@@ -123,16 +127,6 @@ func ReadTree(dir string, version int, prefix []byte) (*iavl.MutableTree, error)
 	return tree, err
 }
 
-func PrintKeys(tree *iavl.MutableTree) {
-	fmt.Println("Printing all keys with hashed values (to detect diff)")
-	tree.Iterate(func(key []byte, value []byte) bool {
-		printKey := parseWeaveKey(key)
-		digest := sha256.Sum256(value)
-		fmt.Printf("  %s\n    %X\n", printKey, digest)
-		return false
-	})
-}
-
 // parseWeaveKey assumes a separating : where all in front should be ascii,
 // and all afterwards may be ascii or binary
 func parseWeaveKey(key []byte) string {
@@ -155,12 +149,6 @@ func encodeID(id []byte) string {
 	return string(id)
 }
 
-func PrintShape(tree *iavl.MutableTree) {
-	// shape := tree.RenderShape("  ", nil)
-	shape := tree.RenderShape("  ", nodeEncoder)
-	fmt.Println(strings.Join(shape, "\n"))
-}
-
 func nodeEncoder(id []byte, depth int, isLeaf bool) string {
 	prefix := fmt.Sprintf("-%d ", depth)
 	if isLeaf {
@@ -172,10 +160,76 @@ func nodeEncoder(id []byte, depth int, isLeaf bool) string {
 	return fmt.Sprintf("%s%s", prefix, parseWeaveKey(id))
 }
 
-func PrintVersions(tree *iavl.MutableTree) {
-	versions := tree.AvailableVersions()
-	fmt.Println("Available versions:")
-	for _, v := range versions {
-		fmt.Printf("  %d\n", v)
+type Transformer struct {
+	env *mdbx.Env
+
+	// it could be null, if so, we need to create it again
+	currentTxn *mdbx.Txn
+	dbi        mdbx.DBI
+
+	name string
+
+	batchNumberLeft int
+}
+
+func NewTransformer(dbName string) *Transformer {
+	env, err := mdbx.NewEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create mdbx env: %s\n", err)
+		os.Exit(1)
 	}
+
+	err = env.Open("/sandbox/terra-mdbx", 0, 0666)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open the env: %s\n", err)
+		os.Exit(1)
+	}
+
+	return &Transformer{
+		env:             env,
+		currentTxn:      nil,
+		name:            dbName,
+		batchNumberLeft: 100,
+	}
+}
+
+func (t *Transformer) walk(key []byte, value []byte) bool {
+	if t.currentTxn == nil {
+		txn, err := t.env.BeginTxn(nil, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to begin tx: %s\n", err)
+			os.Exit(1)
+		}
+
+		dbi, err := txn.CreateDBI(t.name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create dbi: %s\n", err)
+			os.Exit(1)
+		}
+
+		t.currentTxn = txn
+		t.dbi = dbi
+	}
+
+	err := t.currentTxn.Put(t.dbi, key, value, 0)
+	if err != nil {
+		// some errors
+		fmt.Fprintf(os.Stderr, "failed to write to db: %s\n", err)
+		os.Exit(1)
+	}
+
+	t.batchNumberLeft -= 1
+	if t.batchNumberLeft <= 0 {
+		latency, err := t.currentTxn.Commit()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to commit: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("commit stats: %v\n", latency)
+
+		t.currentTxn = nil
+		t.batchNumberLeft = 100
+	}
+
+	return false
 }
