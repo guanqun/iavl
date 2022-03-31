@@ -45,7 +45,23 @@ func main() {
 	}
 
 	for _, prefix := range prefixes {
-		transformer := NewTransformer(prefix)
+		fmt.Printf("handling prefix: %s\n", prefix)
+
+		pipe := make(chan KeyValue)
+		end := make(chan int)
+
+		go func() {
+			transformer := NewTransformer(prefix)
+			for {
+				select {
+				case kv := <-pipe:
+					transformer.walk(kv.key, kv.value)
+				case <-end:
+					transformer.commit()
+					break
+				}
+			}
+		}()
 
 		treePrefix := fmt.Sprintf("s/k:%s/", prefix)
 		tree, err := ReadTree(dbDir, version, []byte(treePrefix))
@@ -55,8 +71,11 @@ func main() {
 		}
 
 		tree.Iterate(func(key []byte, value []byte) bool {
-			return transformer.walk(key, value)
+			pipe <- KeyValue{key: key, value: value}
+			return false
 		})
+
+		end <- 0
 	}
 }
 
@@ -179,38 +198,37 @@ func NewTransformer(dbName string) *Transformer {
 		os.Exit(1)
 	}
 
+	// set the maxdb
+	env.SetOption(mdbx.OptMaxDB, 20)
+
 	err = env.Open("/sandbox/terra-mdbx", 0, 0666)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open the env: %s\n", err)
 		os.Exit(1)
 	}
 
+	txn, err := env.BeginTxn(nil, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to begin tx: %s\n", err)
+		os.Exit(1)
+	}
+
+	dbi, err := txn.CreateDBI(dbName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create dbi: %s\n", err)
+		os.Exit(1)
+	}
+
 	return &Transformer{
 		env:             env,
-		currentTxn:      nil,
+		currentTxn:      txn,
+		dbi:             dbi,
 		name:            dbName,
-		batchNumberLeft: 100,
+		batchNumberLeft: 1000,
 	}
 }
 
-func (t *Transformer) walk(key []byte, value []byte) bool {
-	if t.currentTxn == nil {
-		txn, err := t.env.BeginTxn(nil, 0)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to begin tx: %s\n", err)
-			os.Exit(1)
-		}
-
-		dbi, err := txn.CreateDBI(t.name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create dbi: %s\n", err)
-			os.Exit(1)
-		}
-
-		t.currentTxn = txn
-		t.dbi = dbi
-	}
-
+func (t *Transformer) walk(key []byte, value []byte) {
 	err := t.currentTxn.Put(t.dbi, key, value, 0)
 	if err != nil {
 		// some errors
@@ -220,16 +238,17 @@ func (t *Transformer) walk(key []byte, value []byte) bool {
 
 	t.batchNumberLeft -= 1
 	if t.batchNumberLeft <= 0 {
-		latency, err := t.currentTxn.Commit()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to commit: %s\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("commit stats: %v\n", latency)
-
-		t.currentTxn = nil
-		t.batchNumberLeft = 100
+		fmt.Printf("after 1000")
+		t.batchNumberLeft = 1000
 	}
+}
 
-	return false
+func (t *Transformer) commit() {
+	latency, _ := t.currentTxn.Commit()
+	fmt.Printf("commit stats: %v\n", latency)
+}
+
+type KeyValue struct {
+	key   []byte
+	value []byte
 }
