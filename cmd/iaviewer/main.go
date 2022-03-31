@@ -16,6 +16,7 @@ import (
 // TODO: make this configurable?
 const (
 	DefaultCacheSize int = 10000
+	MaxBatchNumber int = 10000
 )
 
 func main() {
@@ -193,7 +194,7 @@ func NewTransformer(dbName string) *Transformer {
 		env:             env,
 		currentTxn:      nil,
 		name:            dbName,
-		batchNumberLeft: 100,
+		batchNumberLeft: MaxBatchNumber,
 	}
 }
 
@@ -232,7 +233,7 @@ func (t *Transformer) walk(key []byte, value []byte) bool {
 		fmt.Printf("commit stats: %v\n", latency)
 
 		t.currentTxn = nil
-		t.batchNumberLeft = 100
+		t.batchNumberLeft = MaxBatchNumber
 	}
 
 	return false
