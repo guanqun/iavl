@@ -179,6 +179,10 @@ func NewTransformer(dbName string) *Transformer {
 		os.Exit(1)
 	}
 
+
+	// set the maxdb
+	env.SetOption(mdbx.OptMaxDB, 20)
+
 	err = env.Open("/sandbox/terra-mdbx", 0, 0666)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open the env: %s\n", err)
